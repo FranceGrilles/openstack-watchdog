@@ -3,40 +3,57 @@
 A simple "watchdog" script to check the use of OpenStack cloud and ensure compliance with best practices.
 
 
-## Installation
+## Requirements
 
-Clone the project repository on your controller node and place a copy of script in a place of your choice:
-```bash
-git clone https://github.com/FranceGrilles/openstack-watchdog.git /opt/openstack-watchdog-src
-cp /opt/openstack-watchdog-src/watchdog.py /root/watchdog.py
-chmod 700 /root/watchdog.py
-```
+The watchdog script requires access to specific OpenStack databases.
 
-Generate a suitable password and create a read-only user for cinder database:
+To generate a suitable password and create a read-only user:
 ```bash
 WATCHDOG_PASS=$(openssl rand -base64 21)
 mysql -u root -p -e "CREATE USER 'watchdog'@'127.0.0.1' IDENTIFIED BY '${WATCHDOG_PASS}';"
+mysql -u root -p -e "GRANT SELECT ON neutron.* TO 'watchdog'@'127.0.0.1';"
+mysql -u root -p -e "GRANT SELECT ON nova.* TO 'watchdog'@'127.0.0.1';"
 mysql -u root -p -e "GRANT SELECT ON cinder.* TO 'watchdog'@'127.0.0.1';"
 mysql -u root -p -e "FLUSH PRIVILEGES;"
 echo "Generated password: ${WATCHDOG_PASS}"
 ```
 
 
+## Installation
+
+Clone the project repository on your controller node:
+```bash
+git clone https://github.com/FranceGrilles/openstack-watchdog.git /opt/openstack-watchdog-src
+```
+
+Place the watchdog script in a place of your choice:
+```bash
+cp /opt/openstack-watchdog-src/watchdog.py /root/watchdog.py
+chmod 700 /root/watchdog.py
+```
+
+Create the base configuration:
+```bash
+mkdir -p /etc/openstack-watchdog/project.d/
+cp /opt/openstack-watchdog-src/watchdog.conf /etc/openstack-watchdog/
+chmod -R 700 /etc/openstack-watchdog/
+```
+
+
 ## Configuration
 
-Edit **/root/watchdog.py** and configure the following values:
- * **DOMAIN:** The domain of your cloud admin user
- * **PROJECT:** The admin project
- * **LOGIN:** The admin user
- * **PASSWORD:** The password of admin user
- * **OS_AUTH_URL:** The keystone endpoint
- * **MYSQL_PASS:** The password of 'watchdog' mysql user
- * **MAIL_ISSUER_ADDRESS:** The mail address of reports issuer
- * **MAIL_ADMIN_ADDRESS:** The mail of the cloud admin team
- * **PORTS_WHITELIST:** The TCP/UDP ports allowed on Internet
- * **MONITORED_DOMAINS:** The keystone domains to monitor
- * **INACTIVE_GHOST_VOLUME_DELAY:** The number of days before consider a detached unamed volume as ghost
- * **INACTIVE_VOLUME_DELAY:** The number of days before consider a detached volume as inactive
+Configure the global settings in **/etc/openstack-watchdog/watchdog.conf**.
+
+To monitor an OpenStack project, create a specific configuration file. For example, for project **proj1**:
+```
+cp /opt/openstack-watchdog-src/sample.conf /etc/openstack-watchdog/project.d/proj1.conf
+```
+
+The minimal configuration for a project is:
+ * **DEFAULT.domain**: The domain ID
+ * **DEFAULT.project**: The project ID
+ * **DEFAULT.contacts**: The project contacts
+
 
 Once the configuration ready, manually test the script execution:
 ```bash
