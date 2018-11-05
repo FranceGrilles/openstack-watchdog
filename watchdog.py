@@ -1,87 +1,90 @@
 #!/usr/bin/python2
 # -*- coding: utf-8 -*-
 #
-# -- OpenStack Cloud Watchdog --
-# Watch for bad use of cloud, e.g. firewall critical rules and outdated virtual volumes.
+# -- OpenStack Watchdog --
+# A simple tool for cloud resource oversight.
 #
 # Cyrille TOULET <cyrille.toulet@univ-lille.fr>
-# Wed 26 Sep 13:06:26 CEST 2018
+# Mon  5 Nov 10:29:02 CET 2018
 
 
+import ConfigParser
 import smtplib
 import string
 import uuid
+import datetime
+import sys
+import os
+import ast
 import keystoneauth1
 import keystoneauth1.identity
 import keystoneclient.v3.client
-import keystoneclient.v3.users
-import keystoneclient.v3.domains
-import neutronclient.v2_0.client
-import novaclient.client
 import mysql.connector
-import datetime
 
 
-# Cloud admin
-DOMAIN = 'default'
-PROJECT = 'admin'
-LOGIN = 'admin'
-PASSWORD = '****************'
+CONFIG_BASE = "/etc/openstack-watchdog/"
+MAIN_CONFIG = "watchdog.conf"
+PROJECT_DIR = "project.d/"
 
-# OpenStack
-OS_AUTH_URL = "https://cloud.domain.org:35357/v3"
-OS_IDENTITY_API_VERSION = 3
-OS_IMAGE_API_VERSION = 2
-OS_NOVA_API_VERSION = 2
-OS_PROJECT_DOMAIN_NAME = DOMAIN
-OS_USER_DOMAIN_NAME = DOMAIN
-OS_USERNAME = LOGIN
-OS_PASSWORD = PASSWORD
-OS_PROJECT_NAME = PROJECT
+DEFAULT_CONF = {
+    "auth_url": "https://controller:35357/v3",
+    "admin_user": "admin",
+    "admin_project": "admin",
+    "admin_domain": "default",
+    "admin_password": "************",
+    "identity_api_version": "3",
+    "image_api_version": "2",
+    "compute_api_version": "2",
+    "host": "controller",
+    "user": "watchdog",
+    "password": "************",
+    "database": "nova",
+    "smtp_host": "controller",
+    "issuer_address": "no-reply@domain.org",
+    "operator_address": "hpc@domain.org",
+    "signature": "\n\n--\nWatchdog - OpenStack",
+}
 
-# MySQL server
-# Reminder - To create mysql user with limited privileges:
-# CREATE USER 'watchdog'@'127.0.0.1' IDENTIFIED BY '****************';
-# GRANT SELECT ON cinder.* TO 'watchdog'@'127.0.0.1';
-# FLUSH PRIVILEGES;
-MYSQL_HOST = '127.0.0.1'
-MYSQL_USER = 'watchdog'
-MYSQL_PASS = '****************'
-MYSQL_DB = 'cinder'
-
-# Mail server
-MAIL_SMTP_HOST = 'localhost'
-MAIL_ISSUER_ADDRESS = 'no-reply@domain.org'
-MAIL_ADMIN_ADDRESS = 'cloud-admin@domain.org'
-MAIL_CC_ADDRESSES = [MAIL_ADMIN_ADDRESS,]
-MAIL_SIGNATURE = u'''\n\n--\n
-Cloud Watchdog
-'''
-
-# Watchdog
-PORTS_WHITELIST = [80, 443, 8080]
-MONITORED_DOMAINS = ['default', ]
-INACTIVE_GHOST_VOLUME_DELAY = 7
-INACTIVE_VOLUME_DELAY = 45
-
+PROJECT_DEFAULT_CONF = {
+    "domain": "",
+    "project": "",
+    "contacts": "[]",
+    "whitelist": "[]",
+    "allowed_subnets": "[]",
+    "tcp_whitelist": "[]",
+    "udp_whitelist": "[]",
+    "stopped_alert_delay": "1",
+    "running_alert_delay": "15",
+    "orphan_alert_delay": "1",
+    "inactive_alert_delay": "15",
+}
 
 
 class OpenstackWatchdog():
     """
-    This class is used to run some survey tests on OpenStack cloud.
+    This class is used to run some oversight tests on OpenStack cloud.
     """
 
-    def __init__(self):
+    def __init__(self, project_config):
         """
-        Create a connection to OpenStack Cloud during class initialization
+        Create connections to OpenStack cloud during class initialization
+        :param project_config: (ConfigParser.ConfigParser) The project configuration
         """
+        if not os.path.isfile(CONFIG_BASE + MAIN_CONFIG):
+            print >> sys.stderr, "Configuration file " + MAIN_CONFIG + " not found."
+            sys.exit(1)
+
+        self.project_config = project_config
+        self.config = ConfigParser.ConfigParser(DEFAULT_CONF)
+        self.config.read(CONFIG_BASE + MAIN_CONFIG)
+
         credentials = dict()
-        credentials['username'] = OS_USERNAME
-        credentials['password'] = OS_PASSWORD
-        credentials['auth_url'] = OS_AUTH_URL
-        credentials['project_name'] = OS_PROJECT_NAME
-        credentials['project_domain_name'] = OS_PROJECT_DOMAIN_NAME
-        credentials['user_domain_name'] = OS_USER_DOMAIN_NAME
+        credentials['username'] = self.config.get('openstack', 'admin_user')
+        credentials['password'] = self.config.get('openstack', 'admin_password')
+        credentials['project_name'] = self.config.get('openstack', 'admin_project')
+        credentials['project_domain_name'] = self.config.get('openstack', 'admin_domain')
+        credentials['auth_url'] = self.config.get('openstack', 'auth_url')
+        credentials['user_domain_name'] = self.config.get('openstack', 'admin_domain')
 
         self._id = str(uuid.uuid4())[-12:]
 
@@ -89,442 +92,309 @@ class OpenstackWatchdog():
             auth = keystoneauth1.identity.v3.Password(**credentials)
             self.session = keystoneauth1.session.Session(auth=auth)
             self.keystone = keystoneclient.v3.client.Client(session=self.session)
-            self.neutron = neutronclient.v2_0.client.Client(session=self.session)
-            self.nova = novaclient.client.Client(OS_NOVA_API_VERSION , session=self.session)
         except:
-            print "Unable to connect API services to OpenStack"
+            print >> sys.stderr, "Unable to connect API services to OpenStack"
+            sys.exit(1)
 
         try:
-            self.database = mysql.connector.connect(host=MYSQL_HOST, user=MYSQL_USER, password=MYSQL_PASS, database=MYSQL_DB)
+            self.database = mysql.connector.connect(host=self.config.get('mysql', 'host'), 
+                                                    user=self.config.get('mysql', 'user'), 
+                                                    password=self.config.get('mysql', 'password'),
+                                                    database=self.config.get('mysql', 'database'))
             self.mysql = self.database.cursor()
         except:
-            print "Unable to connect to MySQL database"
+            print >> sys.stderr, "Unable to connect to MySQL database"
+            sys.exit(1)
 
+
+        self.domain = self.project_config.get('DEFAULT', 'domain')
+        self.project = self.project_config.get('DEFAULT', 'project')
+        self.contacts = ast.literal_eval(self.project_config.get('DEFAULT', 'contacts'))
+        self.global_alerts = list()
+        self.alerts = dict()
 
 
     def __del__(self):
         """
         Properly close connections before object deletion
         """
-        self.mysql.close()
-        self.database.close()
+        if hasattr(self, "mysql"):
+            self.mysql.close()
+
+        if hasattr(self, "database"):
+            self.database.close()
 
 
 
-    def sendMail(self, dest, subject, message, enableCC = True):
+    def send_mail(self, dest, subject, message, enableCC = True):
         '''
         Send an email from HPC team
 
-        :param dest: (str) The mail recipient address
+        :param dest: (str or list) The mail recipient(s) address
         :param subject: (str) The mail subject
         :param message: (str) The mail message
         :param enableCC: (bool) [optional] Add the CC addresses to recipient addresses
         :raise: HPCBackendException if an error occurs
         '''
+        if type(dest) == list:
+            to = dest
+        else:
+            to = [dest,]
 
-        to = [dest,]
         if enableCC:
-            to = [dest,] + MAIL_CC_ADDRESSES
+            to.append(self.config.get('mail', 'operator_address'))
 
-        headers = 'From: ' + MAIL_ISSUER_ADDRESS + '\n'
+        headers = 'From: ' + self.config.get('mail', 'issuer_address') + '\n'
         headers += 'To: ' + ', '.join(to) + '\n'
         headers += 'Subject: ' + subject + '\n'
         headers += 'Content-Type: text/plain; charset=UTF-8\n\n'
 
         try:
-            server = smtplib.SMTP(MAIL_SMTP_HOST)
-            server.sendmail(MAIL_ISSUER_ADDRESS, to, headers.encode('utf-8') + message.encode('utf-8') + MAIL_SIGNATURE.encode('utf-8'))
+            server = smtplib.SMTP(self.config.get('mail', 'smtp_host'))
+            server.sendmail(self.config.get('mail', 'issuer_address'), to, 
+                            headers.encode('utf-8') + message.encode('utf-8') + 
+                            self.config.get('mail', 'signature').encode('utf-8'))
             server.quit()
 
         except Exception as error:
-            print(str(error))
+            print >> sys.stderr, str(error)
 
 
 
-    def _get_project(self, project_id):
+    def register_global_alert(self, message):
         """
-        Get a keystone project from a project ID
-        :param project_id: (str) The project ID
+        Register a global oversight alert
+        :param message: (str) The alert to register
+        """
+        self.global_alerts.append(message)
+
+
+
+    def register_alert(self, user_id, message):
+        """
+        Register an oversight alert
+        :param user_id: (dict) The user ID
+        :param message: (str) The alert to register
+        """
+        if not user_id in self.alerts:
+            self.alerts[user_id] = list()
+
+        self.alerts[user_id].append(message)
+
+
+
+    def send_alerts(self):
+        """
+        Send registred alerts to project contact
+        """
+        users = self.get_users(self.domain, self.project)
+        message = ""
+
+        if len(self.global_alerts) > 0:
+            message += "Global alerts:\n"
+            for alert in self.global_alerts:
+                message += " - " + alert + "\n"
+            message += "\n"
+
+        for uid in self.alerts:
+            user = uid
+            if uid in users:
+                user = users[uid]["name"]
+                if users[uid]["description"]:
+                    user += " (" + users[uid]["description"] + ")"
+
+            if len(self.alerts[uid]) > 1:
+                message += "Alerts for " + user + ":\n"
+            else:
+                message += "Alert for " + user + ":\n"
+
+            for alert in self.alerts[uid]:
+                message += " - " + alert + "\n"
+
+            message += "\n"
+
+        subject = "[Cloud Watchdog] Alerts summary"
+        project = self.get_project(self.project)
+        if hasattr(project, "name"):
+            subject += " for project " + project.name
+
+        self.send_mail(self.contacts, subject, message)
+
+
+    def get_project(self, project):
+        """
+        Get a keystone project from a project name or ID
+        :param project: (str) The project name or ID
         :return: (keystone.projects.Project) The requested project
         """
-        response = self.keystone.projects.get(project_id)
-
+        response = self.keystone.projects.get(project)
         return response
 
 
 
-    def _get_security_groups(self):
-        """
-        Get all security groups
-        :return: (list) The security groups
-        """
-        response = self.neutron.list_security_groups()
-
-        return response['security_groups']
-
-
-
-    def _get_security_group_rules(self, security_group_id):
-        """
-        Get all rules of a security group
-        :param security_group_id: (str) The id of security group
-        :return: (list) The rules of security group
-        :raises Exception: An error occurs during rules fetching
-        """
-        response = self.neutron.list_security_group_rules(security_group_id=security_group_id)
-
-        return response['security_group_rules']
-
-
-
-    def _get_monitored_domains(self):
-        """
-        Get the list of monitored projects
-        :return: (list<keystone.domains.Domain>) The monitored projects
-        """
-        domains = self.keystone.domains.list()
-        monitored_domains = list()
-        for domain in domains:
-            if domain.name in MONITORED_DOMAINS:
-                monitored_domains.append(domain)
-
-        return monitored_domains
-
-
-
-    def _get_users(self, user_domain):
+    def get_users(self, domain, project):
         """
         Get all users of a keystone project
-        :param user_domain: (keystone.domains.Domain) The keystone domain
+        :param domain: (keystone.domains.Domain) The keystone domain
+        :param project: (keystone.projects.Project) The keystone project
         :return: (list<keystone.users.User>) The users of specified domain
         """
         users = dict()
-        for user in self.keystone.users.list(domain=user_domain):
-            description = ''
-            if user.description:
+
+        for user in self.keystone.users.list(default_project=project, domain=domain):
+            description = ""
+            if hasattr(user, "description"):
                 description = user.description
-            users[user.id] = {'name': user.name, 'description': description}
+            users[user.id] = {"name": user.name, "description": description}
 
         return users
 
 
 
-    def watch_security_groups_ports(self):
+    def networks_oversight(self):
         """
-        Survey security groups ports and send report mail
+        Oversight virtual networks and send report mail
         """
-        alerts = False
-        first = True
-        security_groups = self._get_security_groups()
-        subject = u'[Cloud Watchdog] Alerte de sécurité - Ouverture de ports'
-        message = u''
-
-        for security_group in security_groups:
-            new_security_group = True
-            group_id = security_group['id']
-            name = security_group['name']
-            project_id = security_group['project_id']
-            rules = self._get_security_group_rules(group_id)
-
-            for rule in rules:
-                rule_id = rule['id']
-                protocol = rule['protocol']
-                ip = rule['remote_ip_prefix']
-                port_range_min = rule['port_range_min']
-                port_range_max = rule['port_range_max']
-
-                if (protocol == 'tcp' or protocol == 'udp') \
-                   and ip == '0.0.0.0/0' \
-                   and port_range_min == port_range_max  \
-                   and not (port_range_min in PORTS_WHITELIST):
-                    if new_security_group:
-                        new_security_group = False
-                        alerts = True
-
-                        project = self._get_project(project_id)
-                        project_name = project.name
-                        project_description = project.description
-
-                        if not(first):
-                            message += u'\n\n'
-                            print
-
-                        first = False
-
-
-                        message += u'Alerte(s) pour le groupe de sécurité ' + name + u' (' + group_id + u')\n'
-                        message += u'Projet ' + project_name + u' (' + project_id + u')\n'
-
-                    message += u' - Règle en alerte sur le port ' + protocol.upper() + ' ' + str(port_range_min) + u' (' + rule_id + u')\n'
-
-        if alerts:
-            self.sendMail(MAIL_ADMIN_ADDRESS, subject, message, False)
-
-
-
-    def watch_default_security_groups(self):
-        """
-        Survey default security groups and send report mail
-        """
-        alerts = False
-        first = True
-        security_groups = self._get_security_groups()
-        subject = u'[Cloud Watchdog] Alerte de sécurité - Présence de règles dans des groupes de sécurité par défaut'
-        message = u''
-
-        for security_group in security_groups:
-            new_security_group = True
-            group_id = security_group['id']
-            name = security_group['name']
-            project_id = security_group['project_id']
-            rules = self._get_security_group_rules(group_id)
-
-            if name == 'default':
-                for rule in rules:
-                    rule_id = rule['id']
-                    protocol = rule['protocol']
-                    ip = rule['remote_ip_prefix']
-                    port_range_min = rule['port_range_min']
-                    port_range_max = rule['port_range_max']
-
-                    if (protocol == 'tcp' or protocol == 'udp'):
-                        if new_security_group:
-                            new_security_group = False
-                            alerts = True
-
-                            project = self._get_project(project_id)
-                            project_name = project.name
-                            project_description = project.description
-
-                            if not(first):
-                                message += u'\n\n'
-                                print
-
-                            first = False
-
-                            message += u'Alerte(s) pour le groupe de sécurité ' + name + u' (' + group_id + u')\n'
-                            message += u'Projet ' + project_name + u' (' + project_id + u')\n'
-
-                        message += u' - Ports ' + protocol.upper() + ' ' + str(port_range_min) + u':' + str(port_range_max) + u' pour le ' + ip + u' (' + rule_id + u')\n'
-
-        if alerts:
-            self.sendMail(MAIL_ADMIN_ADDRESS, subject, message, False)
-
-
-
-    def watch_volumes_in_error(self):
-        """
-        Survey virtual volumes in error status and send report mail
-        """
-        subject = u'[Cloud Watchdog] Volumes en erreur détectés'
-        message = u''
-
-
-        monitored_domains = self._get_monitored_domains()
-        users = dict()
-
-        for monitored_domain in monitored_domains:
-            domain_users = self._get_users(monitored_domain)
-            users.update(domain_users)
-
-        self.mysql.execute('SELECT created_at, updated_at, deleted_at, deleted, id, user_id, project_id, size, status, display_name FROM volumes WHERE status != "deleted";')
+        self.mysql.execute('USE neutron;')
+        self.mysql.execute('SELECT id, name FROM neutron.securitygroups WHERE project_id = "' + self.project + '";')
         rows = self.mysql.fetchall()
 
-        stats = dict()
+        security_groups = dict()
+        for row in rows:
+            (id, name) = row
+            security_groups[id] = name
+
+        allowed_subnets = ast.literal_eval(self.project_config.get('networks', 'allowed_subnets'))
+        tcp_whitelist = ast.literal_eval(self.project_config.get('networks', 'tcp_whitelist'))
+        udp_whitelist = ast.literal_eval(self.project_config.get('networks', 'udp_whitelist'))
+
+        self.mysql.execute('SELECT id, security_group_id, ethertype, protocol, port_range_min, port_range_max, remote_ip_prefix FROM neutron.securitygrouprules WHERE protocol IS NOT NULL AND direction = "Ingress" AND project_id = "' + self.project + '";')
+        rows = self.mysql.fetchall()
+
+        for row in rows:
+            (id, security_group_id, ethertype, protocol, port_range_min, port_range_max, remote_ip_prefix) = row
+            subnet_mask = '/' + remote_ip_prefix.split('/')[-1]
+
+            if (ethertype == "IPv4" and subnet_mask != "/32") or (ethertype == "IPv6" and subnet_mask != "/128"):
+                if not remote_ip_prefix in allowed_subnets:
+                    if port_range_min == port_range_max:
+                        port = port_range_min
+                    else:
+                        port = str(min(port_range_min, port_range_max)) + ':' + str(max(port_range_min, port_range_max))
+
+                    if (protocol == "tcp" and not port in tcp_whitelist) or (protocol == "udp" and not port in udp_whitelist):
+                        message = ethertype + " " + protocol.upper() + " port " + str(port) + " open to " + remote_ip_prefix + " in security group " + security_groups[security_group_id] + " (" + security_group_id + ")"
+                        self.register_global_alert(message)
+
+
+
+    def instances_oversight(self):
+        """
+        Oversight server instances and send report mail
+        """
+        self.mysql.execute('USE nova;')
+        self.mysql.execute('SELECT created_at, updated_at, deleted_at, deleted, uuid, user_id, project_id, vcpus, memory_mb, vm_state, display_name, node FROM instances WHERE deleted = "0" AND project_id = "' + self.project + '";')
+        rows = self.mysql.fetchall()
+
+        whitelist = ast.literal_eval(self.project_config.get('instances', 'whitelist'))
         now = datetime.date.today()
 
         for row in rows:
-            (created_at, updated_at, deleted_at, deleted, id, user_id, project_id, size, status, display_name) = row
+            (created_at, updated_at, deleted_at, deleted, uuid, user_id, project_id, vcpus, memory_mb, vm_state, display_name, node) = row
 
-            if not user_id in stats:
-                stats[user_id] = list()
+            if uuid in whitelist:
+                continue
 
-            stats[user_id].append(row)
+            created_delta = (now - created_at.date()).days
+            updated_delta = (now - updated_at.date()).days
 
-        volumes_in_error = dict()
-
-        for uid in stats:
-            user = uid
-            if uid in users:
-                user = users[uid]['name']
-                if users[uid]['description']:
-                    user = users[uid]['name'] + ' (' + users[uid]['description'] + ')'
-
-            for volume in stats[uid]:
-                (created_at, updated_at, deleted_at, deleted, id, user_id, project_id, size, status, display_name) = volume
-
-                if status in ['error', 'error_deleting']:
-                    if not user in volumes_in_error:
-                        volumes_in_error[user] = list()
-                    volumes_in_error[user].append(volume)
-
-        for user in volumes_in_error:
-            if len(message) > 0:
-                message += '\n\n'
-
-            message += u'Volume(s) en erreur appartenant(s) à ' + user + ' :\n'
-        
-            for volume in volumes_in_error[user]:
-                (created_at, updated_at, deleted_at, deleted, id, user_id, project_id, size, status, display_name) = volume
-
-                created_delta = (now - created_at.date()).days
-                updated_delta = (now - updated_at.date()).days
-                message += ' - Volume ' + id
+            if vm_state == "error":
+                message = "Instance " + uuid
                 if display_name:
-                    message += ' (' + display_name + ')'
-                message += u' créé le ' + created_at.strftime("%d/%m/%Y") + ' (il y a ' + str(created_delta) + ' jours) en erreur (' + status.upper() + ') depuis ' + str(updated_delta) + ' jours\n'
+                    message += " (" + display_name + ")"
+                message += " created on " + created_at.strftime("%d/%m/%Y") + " (" + str(created_delta) + " days ago) in error ("
+                message += vm_state.upper() + ") since " + str(updated_delta) + " days"
+                self.register_alert(user_id, message)
 
-        if len(message) > 0:
-            self.sendMail(MAIL_ADMIN_ADDRESS, subject, message, False)
-
-
-
-    def watch_volumes_inactive(self):
-        """
-        Survey inactive virtual volumes and send report mail
-        """
-        subject = u'[Cloud Watchdog] Volumes inactifs détectés'
-        message = u''
-
-
-        monitored_domains = self._get_monitored_domains()
-        users = dict()
-
-        for monitored_domain in monitored_domains:
-            domain_users = self._get_users(monitored_domain)
-            users.update(domain_users)
-
-        self.mysql.execute('SELECT created_at, updated_at, deleted_at, deleted, id, user_id, project_id, size, status, display_name FROM volumes WHERE status != "deleted";')
-        rows = self.mysql.fetchall()
-
-        stats = dict()
-        now = datetime.date.today()
-
-        for row in rows:
-            (created_at, updated_at, deleted_at, deleted, id, user_id, project_id, size, status, display_name) = row
-
-            if not user_id in stats:
-                stats[user_id] = list()
-
-            stats[user_id].append(row)
-
-        volumes_inactive = dict()
-
-        for uid in stats:
-            user = uid
-            if uid in users:
-                user = users[uid]['name']
-                if users[uid]['description']:
-                    user = users[uid]['name'] + ' (' + users[uid]['description'] + ')'
-
-            for volume in stats[uid]:
-                (created_at, updated_at, deleted_at, deleted, id, user_id, project_id, size, status, display_name) = volume
-
-                if status == 'available':
-                    updated_delta = (now - updated_at.date()).days
-
+            elif vm_state == "stopped":
+                if updated_delta >= self.project_config.getint('instances', 'stopped_alert_delay'):
+                    message = "Instance " + uuid
                     if display_name:
-                        if updated_delta >= INACTIVE_VOLUME_DELAY:
-                            if not user in volumes_inactive:
-                                volumes_inactive[user] = list()
-                            volumes_inactive[user].append(volume)
+                        message += " (" + display_name + ")"
+                    message += " created on " + created_at.strftime("%d/%m/%Y") + " (" + str(created_delta) + " days ago) stopped ("
+                    message += vm_state.upper() + ") since " + str(updated_delta) + " days"
+                    self.register_alert(user_id, message)
 
-        for user in volumes_inactive:
-            if len(message) > 0:
-                message += '\n\n'
-
-            message += u'Volume(s) inactif(s) appartenant(s) à ' + user + ' :\n'
-        
-            for volume in volumes_inactive[user]:
-                (created_at, updated_at, deleted_at, deleted, id, user_id, project_id, size, status, display_name) = volume
-
-                created_delta = (now - created_at.date()).days
-                updated_delta = (now - updated_at.date()).days
-                message += ' - Volume ' + id
-                if display_name:
-                    message += ' (' + display_name + ')'
-                message += u' créé le ' + created_at.strftime("%d/%m/%Y") + ' (il y a ' + str(created_delta) + ' jours) inactif (' + status.upper() + ') depuis ' + str(updated_delta) + ' jours\n'
-
-        if len(message) > 0:
-            self.sendMail(MAIL_ADMIN_ADDRESS, subject, message, False)
+            elif vm_state == "active":
+                if updated_delta >= self.project_config.getint('instances', 'running_alert_delay'):
+                    message = "Instance " + uuid
+                    if display_name:
+                        message += " (" + display_name + ")"
+                    message += " created on " + created_at.strftime("%d/%m/%Y") + " (" + str(created_delta) + " days ago) running ("
+                    message += vm_state.upper() + ") since a long time (" + str(updated_delta) + " days)"
+                    self.register_alert(user_id, message)
 
 
 
-    def watch_ghost_volumes(self):
+    def volumes_oversight(self):
         """
-        Survey outdated virtual volumes and send report mail
+        Oversight server instances and send report mail
         """
-        subject = u'[Cloud Watchdog] Volumes fantômes détectés'
-        message = u''
-
-
-        monitored_domains = self._get_monitored_domains()
-        users = dict()
-
-        for monitored_domain in monitored_domains:
-            domain_users = self._get_users(monitored_domain)
-            users.update(domain_users)
-
-        self.mysql.execute('SELECT created_at, updated_at, deleted_at, deleted, id, user_id, project_id, size, status, display_name FROM volumes WHERE status != "deleted";')
+        self.mysql.execute('USE cinder;')
+        self.mysql.execute('SELECT created_at, updated_at, deleted_at, deleted, id, user_id, project_id, size, status, display_name FROM volumes WHERE status != "deleted" AND project_id = "' + self.project + '";')
         rows = self.mysql.fetchall()
 
-        stats = dict()
+        whitelist = ast.literal_eval(self.project_config.get('volumes', 'whitelist'))
         now = datetime.date.today()
 
         for row in rows:
             (created_at, updated_at, deleted_at, deleted, id, user_id, project_id, size, status, display_name) = row
 
-            if not user_id in stats:
-                stats[user_id] = list()
+            if id in whitelist:
+                continue
 
-            stats[user_id].append(row)
+            created_delta = (now - created_at.date()).days
+            updated_delta = (now - updated_at.date()).days
 
-        ghost_volumes = dict()
-
-        for uid in stats:
-            user = uid
-            if uid in users:
-                user = users[uid]['name']
-                if users[uid]['description']:
-                    user = users[uid]['name'] + ' (' + users[uid]['description'] + ')'
-
-            for volume in stats[uid]:
-                (created_at, updated_at, deleted_at, deleted, id, user_id, project_id, size, status, display_name) = volume
-
-                if status == 'available':
-                    updated_delta = (now - updated_at.date()).days
-
-                    if not display_name:
-                        if updated_delta >= INACTIVE_GHOST_VOLUME_DELAY:
-                            if not user in ghost_volumes:
-                                ghost_volumes[user] = list()
-                            ghost_volumes[user].append(volume)
-
-        for user in ghost_volumes:
-            if len(message) > 0:
-                message += '\n\n'
-
-            message += u'Volume(s) fantôme(s) appartenant(s) à ' + user + ' :\n'
-        
-            for volume in ghost_volumes[user]:
-                (created_at, updated_at, deleted_at, deleted, id, user_id, project_id, size, status, display_name) = volume
-
-                created_delta = (now - created_at.date()).days
-                updated_delta = (now - updated_at.date()).days
-                message += ' - Volume ' + id
+            if status in ['error', 'error_deleting']:
+                message = "Volume " + id
                 if display_name:
-                    message += ' (' + display_name + ')'
-                message += u' créé le ' + created_at.strftime("%d/%m/%Y") + ' (il y a ' + str(created_delta) + ' jours) inactif (' + status.upper() + ') depuis ' + str(updated_delta) + ' jours\n'
+                    message += " (" + display_name + ")"
+                message += " created on " + created_at.strftime("%d/%m/%Y") + " (" + str(created_delta) + " days ago) in error ("
+                message += status.upper() + ") since " + str(updated_delta) + " days"
+                self.register_alert(user_id, message)
 
-        if len(message) > 0:
-            self.sendMail(MAIL_ADMIN_ADDRESS, subject, message, False)
+            elif status == "available":
+                if not display_name:
+                    if updated_delta >= self.project_config.getint('volumes', 'orphan_alert_delay'):
+                        message = "Volume " + id
+                        message += " created on " + created_at.strftime("%d/%m/%Y") + " (" + str(created_delta) + " days ago) probably orphan ("
+                        message += status.upper() + " since " + str(updated_delta) + " days)"
+                        self.register_alert(user_id, message)
+
+                else:
+                    if updated_delta >= self.project_config.getint('volumes', 'inactive_alert_delay'):
+                        message = "Volume " + id
+                        if display_name:
+                            message += " (" + display_name + ")"
+                        message += " created on " + created_at.strftime("%d/%m/%Y") + " (" + str(created_delta) + " days ago) inactive ("
+                        message += status.upper() + ") since " + str(updated_delta) + " days"
+                        self.register_alert(user_id, message)
 
 
 
 if __name__ == "__main__":
-    watchdog = OpenstackWatchdog()
-    watchdog.watch_security_groups_ports()
-    watchdog.watch_default_security_groups()
-    watchdog.watch_volumes_in_error()
-    watchdog.watch_volumes_inactive()
-    watchdog.watch_ghost_volumes()
+    projects = os.listdir(CONFIG_BASE + PROJECT_DIR)
+
+    for project in projects:
+        if project[-5:] == ".conf":
+            project_config = ConfigParser.ConfigParser(PROJECT_DEFAULT_CONF)
+            project_config.read(CONFIG_BASE + PROJECT_DIR + project)
+
+            watchdog = OpenstackWatchdog(project_config)
+            watchdog.networks_oversight()
+            watchdog.instances_oversight()
+            watchdog.volumes_oversight()
+            watchdog.send_alerts()
+
+    sys.exit(0)
