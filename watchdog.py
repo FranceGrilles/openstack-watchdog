@@ -5,7 +5,7 @@
 # A simple tool for cloud resource oversight.
 #
 # Cyrille TOULET <cyrille.toulet@univ-lille.fr>
-# Mon  5 Nov 10:29:02 CET 2018
+# Mon  5 Nov 16:46:59 CET 2018
 
 
 import ConfigParser
@@ -218,7 +218,8 @@ class OpenstackWatchdog():
         if hasattr(project, "name"):
             subject += " for project " + project.name
 
-        self.send_mail(self.contacts, subject, message)
+        if len(self.global_alerts) + len(self.alerts) > 0:
+            self.send_mail(self.contacts, subject, message)
 
 
     def get_project(self, project):
