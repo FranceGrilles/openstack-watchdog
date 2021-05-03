@@ -1,5 +1,12 @@
 # OpenStack Watchdog
 
+---
+**IMPORTANT:** This project is deprecated!
+Use gerenuk & openstack-gerenuk-ui instead:
+ * https://github.com/cyrilletoulet/gerenuk/
+ * https://github.com/cyrilletoulet/openstack-gerenuk-ui
+---
+
 A simple "watchdog" script to check the use of OpenStack cloud and ensure compliance with best practices.
 
 
